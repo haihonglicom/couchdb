@@ -223,15 +223,15 @@ couch_readline(JSContext* cx, FILE* fp)
 
     bytes = static_cast<char*>(JS_malloc(cx, byteslen));
     if(bytes == NULL) return NULL;
-    
+
     while((readlen = couch_fgets(bytes+used, byteslen-used, fp)) > 0) {
         used += readlen;
-        
+
         if(bytes[used-1] == '\n') {
             bytes[used-1] = '\0';
             break;
         }
-        
+
         // Double our buffer and read more.
         oldbyteslen = byteslen;
         byteslen *= 2;
@@ -240,7 +240,7 @@ couch_readline(JSContext* cx, FILE* fp)
             JS_free(cx, bytes);
             return NULL;
         }
-        
+
         bytes = tmp;
     }
 
@@ -250,7 +250,7 @@ couch_readline(JSContext* cx, FILE* fp)
         return JS_NewStringCopyZ(cx, nullptr);
     }
 
-    // Shring the buffer to the actual data size
+    // Shrink the buffer to the actual data size
     tmp = static_cast<char*>(JS_realloc(cx, bytes, byteslen, used));
     if(!tmp) {
         JS_free(cx, bytes);

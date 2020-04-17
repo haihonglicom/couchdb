@@ -21,8 +21,6 @@
 #include <unistd.h>
 #endif
 
-#include <sstream>
-
 #include <jsapi.h>
 #include <js/Initialization.h>
 #include <js/Conversions.h>
