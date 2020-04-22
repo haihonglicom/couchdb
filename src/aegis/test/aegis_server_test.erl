@@ -15,7 +15,6 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("couch/include/couch_eunit.hrl").
 
--define(SERVER, aegis_server).
 -define(DB, #{aegis => <<0:320>>, uuid => <<0:64>>}).
 -define(VALUE, <<0:8192>>).
 -define(ENCRYPTED, <<1:8, 0:320, 0:4096>>).
@@ -215,3 +214,110 @@ test_disabled_decrypt() ->
 
     ?assertEqual(0, meck:num_calls(aegis_key_manager, unwrap_key, 2)),
     ?assertEqual(0, meck:num_calls(aegis_server, do_decrypt, 5)).
+
+
+
+lru_cache_with_expiration_test_() ->
+    {
+        foreach,
+        fun() ->
+            Ctx = setup(),
+            meck:new([config], [passthrough]),
+            ok = meck:expect(config, get_integer, fun
+                ("aegis", "cache_limit", _) -> 5;
+                (_, _, Default) -> Default
+            end),
+            ok = meck:expect(aegis_server, now_sec, fun() ->
+                get(time) == undefined andalso put(time, 0),
+                Now = get(time),
+                put(time, Now + 20),
+                Now
+            end),
+            Ctx
+        end,
+        fun teardown/1,
+        [
+            {"counter moves forward on access bump",
+            {timeout, ?TIMEOUT, fun test_advance_counter/0}},
+            {"oldest entries evicted",
+            {timeout, ?TIMEOUT, fun test_evict_old_entries/0}},
+            {"access bump preserves entries",
+            {timeout, ?TIMEOUT, fun test_bump_accessed/0}}
+        ]
+    }.
+
+
+test_advance_counter() ->
+    ets:new(?MODULE, [named_table, set, public]),
+
+    ok = meck:expect(aegis_server, handle_cast, fun({accessed, _} = Msg, St) ->
+        #{counter := Counter} = St,
+        get(counter) == undefined andalso put(counter, 0),
+        OldCounter = get(counter),
+        put(counter, Counter),
+        ets:insert(?MODULE, {counter, {OldCounter, Counter}}),
+        meck:passthrough([Msg, St])
+    end),
+
+    lists:foreach(fun(I) ->
+        Db = ?DB#{uuid => <<I:64>>},
+        aegis_server:encrypt(Db, <<I:64>>, ?VALUE),
+        aegis_server:decrypt(Db, <<I:64>>, ?VALUE),
+        [{counter, {OldCounter, Counter}}] = ets:lookup(?MODULE, counter),
+        ?assert(Counter > OldCounter)
+    end, lists:seq(1, 10)),
+
+    ets:delete(?MODULE).
+
+
+test_evict_old_entries() ->
+    ?assertEqual(0, meck:num_calls(aegis_key_manager, unwrap_key, 2)),
+
+    %% overflow cache
+    lists:foreach(fun(I) ->
+        Db = ?DB#{uuid => <<I:64>>},
+        aegis_server:encrypt(Db, <<I:64>>, ?VALUE)
+    end, lists:seq(1, 10)),
+
+    ?assertEqual(10, meck:num_calls(aegis_key_manager, unwrap_key, 2)),
+
+    %% newest still in cache
+    lists:foreach(fun(I) ->
+        Db = ?DB#{uuid => <<I:64>>},
+        aegis_server:decrypt(Db, <<I:64>>, ?VALUE)
+    end, lists:seq(6, 10)),
+
+    ?assertEqual(10, meck:num_calls(aegis_key_manager, unwrap_key, 2)),
+
+    %% oldest been eviced and needed re-fetch
+    lists:foreach(fun(I) ->
+        Db = ?DB#{uuid => <<I:64>>},
+        aegis_server:decrypt(Db, <<I:64>>, ?VALUE)
+    end, lists:seq(1, 5)),
+
+    ?assertEqual(15, meck:num_calls(aegis_key_manager, unwrap_key, 2)).
+
+
+test_bump_accessed() ->
+    ?assertEqual(0, meck:num_calls(aegis_key_manager, unwrap_key, 2)),
+
+    %% fill the cache
+    lists:foreach(fun(I) ->
+        Db = ?DB#{uuid => <<I:64>>},
+        aegis_server:encrypt(Db, <<I:64>>, ?VALUE)
+    end, lists:seq(1, 5)),
+
+    ?assertEqual(5, meck:num_calls(aegis_key_manager, unwrap_key, 2)),
+
+    %% bump oldest and insert new rec
+    aegis_server:decrypt(?DB#{uuid => <<1:64>>}, <<1:64>>, ?VALUE),
+    aegis_server:encrypt(?DB#{uuid => <<6:64>>}, <<6:64>>, ?VALUE),
+    ?assertEqual(6, meck:num_calls(aegis_key_manager, unwrap_key, 2)),
+
+    %% confirm former oldest still in cache
+    aegis_server:decrypt(?DB#{uuid => <<1:64>>}, <<1:64>>, ?VALUE),
+    ?assertEqual(6, meck:num_calls(aegis_key_manager, unwrap_key, 2)),
+
+    %% confirm second oldest been evicted by new insert
+    aegis_server:decrypt(?DB#{uuid => <<2:64>>}, <<2:64>>, ?VALUE),
+    ?assertEqual(7, meck:num_calls(aegis_key_manager, unwrap_key, 2)).

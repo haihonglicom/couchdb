@@ -46,12 +46,20 @@
     do_decrypt/5
 ]).
 
+%% tmp for test, move to util module
+-export([
+    now_sec/0
+]).
+
 
 -define(INIT_TIMEOUT, 60000).
 -define(TIMEOUT, 10000).
+-define(DEFAULT_CACHE_LIMIT, 100000).
+-define(DEFAULT_CACHE_MAX_AGE_SEC, 1800).
+-define(LAST_ACCESSED_QUIESCENCE_SEC, 10).
 
 
--record(entry, {id, key}).
+-record(entry, {id, key, counter, last_accessed, expires_at}).
 
 
 start_link() ->
@@ -79,9 +87,13 @@ decrypt(#{} = Db, Key, Value) when is_binary(Key), is_binary(Value) ->
 init([]) ->
     process_flag(sensitive, true),
     Cache = ets:new(?MODULE, [set, private, {keypos, #entry.id}]),
+    ByAccess = ets:new(?MODULE,
+        [ordered_set, private, {keypos, #entry.counter}]),
 
     St = #{
         cache => Cache,
+        by_access => ByAccess,
+        counter => 0,
         openers => dict:new(),
         waiters => dict:new(),
         unwrappers => dict:new()
@@ -129,6 +141,10 @@ handle_call(_Msg, _From, St) ->
     {noreply, St}.
 
 
+handle_cast({accessed, UUID}, St) ->
+    NewCounter = bump_last_accessed(St, UUID),
+    {noreply, St#{counter := NewCounter}};
+
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
@@ -140,7 +156,6 @@ handle_info({'DOWN', Ref, _, _Pid, false}, #{openers := Openers} = St) ->
 
 handle_info({'DOWN', Ref, _, _Pid, {ok, DbKey, AegisConfig}}, St) ->
     #{
-        cache := Cache,
         openers := Openers,
         waiters := Waiters,
         unwrappers := Unwrappers
@@ -148,12 +163,13 @@ handle_info({'DOWN', Ref, _, _Pid, {ok, DbKey, AegisConfig}}, St) ->
 
     case dict:take(Ref, Openers) of
         {{UUID, From}, Openers1} ->
-            ok = insert(Cache, UUID, DbKey),
+            NewCounter = insert(St, UUID, DbKey),
             gen_server:reply(From, {ok, AegisConfig}),
-            {noreply, St#{openers := Openers1}, ?TIMEOUT};
+            NewSt = St#{openers := Openers1, counter := NewCounter},
+            {noreply, NewSt, ?TIMEOUT};
         error ->
             {UUID, Unwrappers1} = dict:take(Ref, Unwrappers),
-            ok = insert(Cache, UUID, DbKey),
+            NewCounter = insert(St, UUID, DbKey),
             Unwrappers2 = dict:erase(UUID, Unwrappers1),
 
             {WaitList, Waiters1} = dict:take(UUID, Waiters),
@@ -165,7 +181,11 @@ handle_info({'DOWN', Ref, _, _Pid, {ok, DbKey, AegisConfig}}, St) ->
                 } = Waiter,
                 erlang:spawn(?MODULE, Action, [From, DbKey | Args])
             end, WaitList),
-            NewSt = St#{waiters := Waiters1, unwrappers := Unwrappers2},
+            NewSt = St#{
+                waiters := Waiters1,
+                unwrappers := Unwrappers2,
+                counter := NewCounter
+            },
             {noreply, NewSt, ?TIMEOUT}
     end;
 
@@ -286,11 +306,10 @@ do_decrypt(From, DbKey, #{uuid := UUID}, Key, Value) ->
 
 maybe_spawn_worker(St, From, Action, #{uuid := UUID} = Db, Key, Value) ->
     #{
-        cache := Cache,
         waiters := Waiters
     } = St,
 
-    case lookup(Cache, UUID) of
+    case lookup(St, UUID) of
         {ok, DbKey} ->
             erlang:spawn(?MODULE, Action, [From, DbKey, Db, Key, Value]),
             St;
@@ -324,16 +343,100 @@ maybe_spawn_unwrapper(St, #{uuid := UUID} = Db) ->
 
 %% cache functions
 
-insert(Cache, UUID, DbKey) ->
-    Entry = #entry{id = UUID, key = DbKey},
+insert(St, UUID, DbKey) ->
+    #{
+        cache := Cache,
+        by_access := ByAccess,
+        counter := Counter
+    } = St,
+
+    Entry = #entry{
+        id = UUID,
+        key = DbKey,
+        counter = Counter,
+        last_accessed = ?MODULE:now_sec(),
+        expires_at = ?MODULE:now_sec() + max_age()
+    },
+
     true = ets:insert(Cache, Entry),
-    ok.
+    true = ets:insert_new(ByAccess, Entry),
+
+    maybe_evict_old_entries(St),
+
+    Counter + 1.
 
 
-lookup(Cache, UUID) ->
+lookup(#{cache := Cache}, UUID) ->
     case ets:lookup(Cache, UUID) of
-        [#entry{id = UUID, key = DbKey}] ->
+        [#entry{id = UUID, key = DbKey} = Entry] ->
+            maybe_bump_last_accessed(Entry),
             {ok, DbKey};
         [] ->
             {error, not_found}
     end.
+
+
+maybe_bump_last_accessed(#entry{last_accessed = LastAccessed} = Entry) ->
+    case ?MODULE:now_sec() > LastAccessed + ?LAST_ACCESSED_QUIESCENCE_SEC of
+        true ->
+            gen_server:cast(?MODULE, {accessed, Entry#entry.id});
+        false ->
+            ok
+    end.
+
+
+bump_last_accessed(St, UUID) ->
+    #{
+        cache := Cache,
+        by_access := ByAccess,
+        counter := Counter
+    } = St,
+
+    [#entry{counter = OldCounter} = Entry0] = ets:lookup(Cache, UUID),
+
+    Entry = Entry0#entry{
+        last_accessed = now_sec(),
+        counter = Counter
+    },
+
+    true = ets:insert(Cache, Entry),
+    true = ets:insert_new(ByAccess, Entry),
+
+    ets:delete(ByAccess, OldCounter),
+
+    Counter + 1.
+
+
+maybe_evict_old_entries(#{cache := Cache} = St) ->
+    CacheLimit = cache_limit(),
+    CacheSize = ets:info(Cache, size),
+    evict_old_entries(St, CacheSize - CacheLimit).
+
+
+evict_old_entries(St, N) when N > 0 ->
+    #{
+        cache := Cache,
+        by_access := ByAccess
+    } = St,
+
+    OldestKey = ets:first(ByAccess),
+    [#entry{id = UUID}] = ets:lookup(ByAccess, OldestKey),
+    true = ets:delete(Cache, UUID),
+    true = ets:delete(ByAccess, OldestKey),
+    evict_old_entries(St, N - 1);
+
+evict_old_entries(_St, _) ->
+    ok.
+
+
+now_sec() ->
+    {Mega, Sec, _} = os:timestamp(),
+    Mega * 1000000 + Sec.
+
+
+max_age() ->
+    config:get_integer("aegis", "cache_max_age_sec",?DEFAULT_CACHE_MAX_AGE_SEC).
+
+
+cache_limit() ->
+    config:get_integer("aegis", "cache_limit", ?DEFAULT_CACHE_LIMIT).
